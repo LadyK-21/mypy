@@ -25,7 +25,8 @@ import os.path
 import re
 import sys
 import time
-from typing import TYPE_CHECKING, Any, Dict, Iterable, NoReturn, cast
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, NoReturn, Union, cast
 
 from mypy.build import BuildSource
 from mypy.errors import CompileError
@@ -40,30 +41,46 @@ from mypyc.ir.pprint import format_modules
 from mypyc.namegen import exported_name
 from mypyc.options import CompilerOptions
 
-if TYPE_CHECKING:
-    from distutils.core import Extension
-
 try:
     # Import setuptools so that it monkey-patch overrides distutils
-    import setuptools  # noqa: F401
+    import setuptools
 except ImportError:
+    pass
+
+if TYPE_CHECKING:
     if sys.version_info >= (3, 12):
-        # Raise on Python 3.12, since distutils will go away forever
-        raise
-from distutils import ccompiler, sysconfig
+        from setuptools import Extension
+    else:
+        from distutils.core import Extension as _distutils_Extension
+        from typing_extensions import TypeAlias
+
+        from setuptools import Extension as _setuptools_Extension
+
+        Extension: TypeAlias = Union[_setuptools_Extension, _distutils_Extension]
+
+if sys.version_info >= (3, 12):
+    # From setuptools' monkeypatch
+    from distutils import ccompiler, sysconfig  # type: ignore[import-not-found]
+else:
+    from distutils import ccompiler, sysconfig
 
 
 def get_extension() -> type[Extension]:
     # We can work with either setuptools or distutils, and pick setuptools
     # if it has been imported.
     use_setuptools = "setuptools" in sys.modules
+    extension_class: type[Extension]
 
-    if not use_setuptools:
-        from distutils.core import Extension
+    if sys.version_info < (3, 12) and not use_setuptools:
+        import distutils.core
+
+        extension_class = distutils.core.Extension
     else:
-        from setuptools import Extension
+        if not use_setuptools:
+            sys.exit("error: setuptools not installed")
+        extension_class = setuptools.Extension
 
-    return Extension
+    return extension_class
 
 
 def setup_mypycify_vars() -> None:
@@ -71,7 +88,7 @@ def setup_mypycify_vars() -> None:
     # There has to be a better approach to this.
 
     # The vars can contain ints but we only work with str ones
-    vars = cast(Dict[str, str], sysconfig.get_config_vars())
+    vars = cast(dict[str, str], sysconfig.get_config_vars())
     if sys.platform == "darwin":
         # Disable building 32-bit binaries, since we generate too much code
         # for a 32-bit Mach-O object. There has to be a better way to do this.
@@ -83,6 +100,22 @@ def setup_mypycify_vars() -> None:
 def fail(message: str) -> NoReturn:
     # TODO: Is there something else we should do to fail?
     sys.exit(message)
+
+
+def emit_messages(options: Options, messages: list[str], dt: float, serious: bool = False) -> None:
+    # ... you know, just in case.
+    if options.junit_xml:
+        py_version = f"{options.python_version[0]}_{options.python_version[1]}"
+        write_junit_xml(
+            dt,
+            serious,
+            {None: messages} if messages else {},
+            options.junit_xml,
+            py_version,
+            options.platform,
+        )
+    if messages:
+        print("\n".join(messages))
 
 
 def get_mypy_config(
@@ -191,46 +224,34 @@ def generate_c(
     """
     t0 = time.time()
 
-    # Do the actual work now
-    serious = False
-    result = None
     try:
         result = emitmodule.parse_and_typecheck(
             sources, options, compiler_options, groups, fscache
         )
-        messages = result.errors
     except CompileError as e:
-        messages = e.messages
-        if not e.use_stdout:
-            serious = True
+        emit_messages(options, e.messages, time.time() - t0, serious=(not e.use_stdout))
+        sys.exit(1)
 
     t1 = time.time()
+    if result.errors:
+        emit_messages(options, result.errors, t1 - t0)
+        sys.exit(1)
+
     if compiler_options.verbose:
         print(f"Parsed and typechecked in {t1 - t0:.3f}s")
 
-    if not messages and result:
-        errors = Errors()
-        modules, ctext = emitmodule.compile_modules_to_c(
-            result, compiler_options=compiler_options, errors=errors, groups=groups
-        )
-
-        if errors.num_errors:
-            messages.extend(errors.new_messages())
-
+    errors = Errors(options)
+    modules, ctext = emitmodule.compile_modules_to_c(
+        result, compiler_options=compiler_options, errors=errors, groups=groups
+    )
     t2 = time.time()
+    emit_messages(options, errors.new_messages(), t2 - t1)
+    if errors.num_errors:
+        # No need to stop the build if only warnings were emitted.
+        sys.exit(1)
+
     if compiler_options.verbose:
         print(f"Compiled to C in {t2 - t1:.3f}s")
-
-    # ... you know, just in case.
-    if options.junit_xml:
-        py_version = f"{options.python_version[0]}_{options.python_version[1]}"
-        write_junit_xml(
-            t2 - t0, serious, messages, options.junit_xml, py_version, options.platform
-        )
-
-    if messages:
-        print("\n".join(messages))
-        sys.exit(1)
 
     return ctext, "\n".join(format_modules(modules))
 
@@ -450,6 +471,7 @@ def mypycify(
     skip_cgen_input: Any | None = None,
     target_dir: str | None = None,
     include_runtime_files: bool | None = None,
+    strict_dunder_typing: bool = False,
 ) -> list[Extension]:
     """Main entry point to building using mypyc.
 
@@ -489,6 +511,9 @@ def mypycify(
                                should be directly #include'd instead of linked
                                separately in order to reduce compiler invocations.
                                Defaults to False in multi_file mode, True otherwise.
+        strict_dunder_typing: If True, force dunder methods to have the return type
+                              of the method strictly, which can lead to more
+                              optimization opportunities. Defaults to False.
     """
 
     # Figure out our configuration
@@ -499,6 +524,7 @@ def mypycify(
         separate=separate is not False,
         target_dir=target_dir,
         include_runtime_files=include_runtime_files,
+        strict_dunder_typing=strict_dunder_typing,
     )
 
     # Generate all the actual important C code
@@ -534,6 +560,10 @@ def mypycify(
             "-Wno-unused-command-line-argument",
             "-Wno-unknown-warning-option",
             "-Wno-unused-but-set-variable",
+            "-Wno-ignored-optimization-argument",
+            # Disables C Preprocessor (cpp) warnings
+            # See https://github.com/mypyc/mypyc/issues/956
+            "-Wno-cpp",
         ]
     elif compiler.compiler_type == "msvc":
         # msvc doesn't have levels, '/O2' is full and '/Od' is disable

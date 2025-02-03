@@ -27,8 +27,14 @@ from mypy.nodes import (
     UnaryExpr,
     Var,
 )
+from mypy.semanal import refers_to_fullname
+from mypy.types import FINAL_DECORATOR_NAMES
 
 DATACLASS_DECORATORS = {"dataclasses.dataclass", "attr.s", "attr.attrs"}
+
+
+def is_final_decorator(d: Expression) -> bool:
+    return refers_to_fullname(d, FINAL_DECORATOR_NAMES)
 
 
 def is_trait_decorator(d: Expression) -> bool:
@@ -67,6 +73,8 @@ def is_dataclass(cdef: ClassDef) -> bool:
     return any(is_dataclass_decorator(d) for d in cdef.decorators)
 
 
+# The string values returned by this function are inspected in
+# mypyc/lib-rt/misc_ops.c:CPyDataclass_SleightOfHand(...).
 def dataclass_type(cdef: ClassDef) -> str | None:
     for d in cdef.decorators:
         typ = dataclass_decorator_type(d)
@@ -119,7 +127,10 @@ def get_mypyc_attrs(stmt: ClassDef | Decorator) -> dict[str, Any]:
 
 def is_extension_class(cdef: ClassDef) -> bool:
     if any(
-        not is_trait_decorator(d) and not is_dataclass_decorator(d) and not get_mypyc_attr_call(d)
+        not is_trait_decorator(d)
+        and not is_dataclass_decorator(d)
+        and not get_mypyc_attr_call(d)
+        and not is_final_decorator(d)
         for d in cdef.decorators
     ):
         return False
@@ -177,3 +188,13 @@ def is_constant(e: Expression) -> bool:
             )
         )
     )
+
+
+def bytes_from_str(value: str) -> bytes:
+    """Convert a string representing bytes into actual bytes.
+
+    This is needed because the literal characters of BytesExpr (the
+    characters inside b'') are stored in BytesExpr.value, whose type is
+    'str' not 'bytes'.
+    """
+    return bytes(value, "utf8").decode("unicode-escape").encode("raw-unicode-escape")
